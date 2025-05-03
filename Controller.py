@@ -1,26 +1,45 @@
-#!/usr/bin/env python
-import rospy
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 import numpy as np
 
-class TriangleVectorField:
-    def __init__(self, vertices, field_vectors):
+INITIAL_POSITION = [0, 0]
+EDGE_THRESHOLD = 0.1  # Threshold to detect proximity to an edge
+
+class Triangle:
+    def __init__(self, vertices, transition_direction=None):
         """
-        Initializes the vector field over a triangle.
-        :param vertices: List of three vertices (each vertex is [x, y]).
-        :param field_vectors: List of vector values at each vertex (each is [vx, vy]).
+        :param vertices: List of 3 points representing the vertices of the triangle.
+        :param transition_direction: Vector field direction towards the next triangle
         """
-        self.vertices = np.array(vertices)
+        self.vertices = np.array(vertices)  # Vertices of the triangle
+        self.field_vectors = None  # To be set after the transition path is known
+        self.transition_direction = transition_direction  # Direction towards next triangle
+        self.next_triangle_idx = None  # To be set when transition logic is determined
+
+    def set_field_vectors(self, field_vectors):
+        """
+        Set the vector field for the triangle.
+        :param field_vectors: List of vectors corresponding to the vertices.
+        """
         self.field_vectors = np.array(field_vectors)
-    
+
+    def set_next_triangle(self, next_triangle_idx):
+        """
+        Set the index of the next triangle to transition to.
+        :param next_triangle_idx: The index of the next triangle in the path.
+        """
+        self.next_triangle_idx = next_triangle_idx
+
     def barycentric_coordinates(self, point):
         """
-        Compute barycentric coordinates of a point with respect to the triangle.
-        :param point: The [x, y] coordinates of the point.
-        :return: Array of barycentric coordinates [λ1, λ2, λ3].
+        Compute barycentric coordinates of the point with respect to the triangle.
+        :param point: The point in the plane.
+        :return: Barycentric coordinates [lambda1, lambda2, lambda3].
         """
-        # Let v0 = vertex2 - vertex1, v1 = vertex3 - vertex1, and v2 = point - vertex1.
         v0 = self.vertices[1] - self.vertices[0]
         v1 = self.vertices[2] - self.vertices[0]
         v2 = point - self.vertices[0]
@@ -30,74 +49,184 @@ class TriangleVectorField:
         d20 = np.dot(v2, v0)
         d21 = np.dot(v2, v1)
         denom = d00 * d11 - d01 * d01
-        # Avoid division by zero. This should not happen if triangle is non-degenerate.
         if denom == 0:
             return np.array([1.0, 0.0, 0.0])
         lambda2 = (d11 * d20 - d01 * d21) / denom
         lambda3 = (d00 * d21 - d01 * d20) / denom
         lambda1 = 1.0 - lambda2 - lambda3
         return np.array([lambda1, lambda2, lambda3])
-    
+
     def get_desired_velocity(self, point):
         """
-        Computes the desired velocity at a given point inside the triangle.
-        :param point: Current position [x, y] of the robot.
-        :return: Desired velocity vector [vx, vy] computed by affine interpolation.
+        Calculate the desired velocity of the robot given the point inside the triangle.
+        :param point: Current robot position.
+        :return: The desired velocity (2D vector).
         """
         lambdas = self.barycentric_coordinates(point)
-        desired_vel = (lambdas[0] * self.field_vectors[0] +
-                       lambdas[1] * self.field_vectors[1] +
-                       lambdas[2] * self.field_vectors[2])
-        return desired_vel
+        return lambdas[0] * self.field_vectors[0] + lambdas[1] * self.field_vectors[1] + lambdas[2] * self.field_vectors[2]
 
-class VectorFieldController:
-    def __init__(self):
-        rospy.init_node('vector_field_controller', anonymous=True)
+    def is_point_near_edge(self, point, threshold=EDGE_THRESHOLD):
+        """
+        Check if the point (robot's position) is close to any of the triangle's edges.
+        :param point: Current position of the robot.
+        :param threshold: Distance threshold to consider proximity to edge.
+        :return: True if the point is close to any edge of the triangle, False otherwise.
+        """
+        # Check distance to each edge of the triangle
+        for i in range(3):
+            p1 = self.vertices[i]
+            p2 = self.vertices[(i + 1) % 3]
+            dist = self.distance_to_edge(point, p1, p2)
+            if dist < threshold:
+                return True
+        return False
+
+    def distance_to_edge(self, point, p1, p2):
+        """
+        Calculate the perpendicular distance from the point to the line segment defined by p1 and p2.
+        :param point: Current position of the robot.
+        :param p1, p2: The endpoints of the edge of the triangle.
+        :return: Perpendicular distance to the edge.
+        """
+        # Vector from p1 to p2
+        edge_vec = p2 - p1
+        # Vector from p1 to the point
+        point_vec = point - p1
+        # Projection of point_vec onto edge_vec (dot product)
+        edge_length = np.linalg.norm(edge_vec)
+        if edge_length == 0:
+            return np.linalg.norm(point - p1)  # If edge length is zero (degenerate case), return distance to p1
+        projection = np.dot(point_vec, edge_vec) / edge_length
+        # Find the closest point on the edge
+        closest_point = p1 + projection * edge_vec / edge_length
+        return np.linalg.norm(point - closest_point)
+
+class TriangleGraph:
+    def __init__(self, triangles):
+        """
+        :param triangles: List of Triangle objects.
+        """
+        self.triangles = triangles
+        self.path = []  # Path for the transitions from one triangle to another
+
+    def set_path(self, path):
+        """
+        Set the transition path between triangles.
+        :param path: List of triangle indices representing the order of triangles.
+        """
+        self.path = path
+
+    def get_next_triangle(self, current_triangle_idx):
+        """
+        Given the current triangle index, return the next triangle in the path.
+        :param current_triangle_idx: Index of the current triangle.
+        :return: Index of the next triangle.
+        """
+        return self.path[current_triangle_idx] if current_triangle_idx < len(self.path) else None
+
+    def calculate_vector_fields(self):
+        """
+        Given the current path, calculate and set the vector field for each triangle.
+        The vector field should guide the robot towards the next triangle.
+        """
+        for i in range(len(self.triangles) - 1):
+            current_triangle = self.triangles[i]
+            next_triangle = self.triangles[i + 1]
+
+            # Calculate a simple vector field that directs the robot towards the next triangle
+            # Example: average direction from the centroid of the current triangle to the centroid of the next triangle
+            centroid_current = np.mean(current_triangle.vertices, axis=0)
+            centroid_next = np.mean(next_triangle.vertices, axis=0)
+
+            # Calculate the direction vector (normalized)
+            direction = centroid_next - centroid_current
+            direction /= np.linalg.norm(direction)  # Normalize the vector
+
+            # Set the transition direction for the current triangle
+            current_triangle.set_field_vectors([direction, direction, direction])
+
+class VectorFieldController(Node):
+    def __init__(self, graph):
+        super().__init__('vector_field_controller')
+
         # Publisher for velocity commands:
-        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
         # Subscribe to odometry for current robot position:
-        rospy.Subscriber('/odom', Odometry, self.odom_callback)
+        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+        self.graph = graph  # Graph representing the triangulation and adjacency
+        self.current_position = np.array(INITIAL_POSITION)
+        self.current_triangle_idx = 0  # Start at the first triangle
         
-        # Example: Define a triangle with vertices and assign vector values at the vertices.
-        # In practice, these would be calculated based on your high-level plan and desired cell exit.
-        vertices = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
-        # Example field_vectors: these determine the "flow" within the cell.
-        # Here, they are chosen so that the desired flow pushes the robot toward one side (e.g., the exit boundary).
-        field_vectors = [[0.5, 0.0], [0.5, 0.2], [0.5, -0.2]]
-        self.triangle_field = TriangleVectorField(vertices, field_vectors)
-        
-        # Initialize robot position (assumed 2D):
-        self.current_position = np.array([0.0, 0.0])
-        self.rate = rospy.Rate(10)  # 10 Hz loop rate
-    
+        # Timer for the control loop
+        timer_period = 0.1  # seconds (10 Hz)
+        self.timer = self.create_timer(timer_period, self.control_loop_callback)
+
     def odom_callback(self, msg):
+        """ Callback to update the robot's position from odometry """
+        self.current_position = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y])
+
+    def transition_to_next_triangle(self):
         """
-        Callback to update the current robot position from odometry.
+        Transition to the next triangle in the path, if robot is close to an edge.
         """
-        self.current_position = np.array([msg.pose.pose.position.x,
-                                           msg.pose.pose.position.y])
-    
+        current_triangle = self.graph.triangles[self.current_triangle_idx]
+        
+        # Check if the robot is close to any edge of the current triangle
+        if current_triangle.is_point_near_edge(self.current_position, threshold=EDGE_THRESHOLD):
+            next_triangle_idx = self.graph.get_next_triangle(self.current_triangle_idx)
+            if next_triangle_idx is not None:
+                self.current_triangle_idx = next_triangle_idx
+
     def run(self):
-        """
-        Main control loop that computes and publishes velocity commands.
-        """
-        while not rospy.is_shutdown():
-            # Compute the desired velocity from the vector field for the current position.
-            desired_vel = self.triangle_field.get_desired_velocity(self.current_position)
-            
-            # Create and publish a Twist message.
+        """ Main control loop """
+        while not rclpy.is_shutdown():
+            # Transition to next triangle if near the edge
+            self.transition_to_next_triangle()
+
+            # Get the current triangle and compute the velocity
+            current_triangle = self.graph.triangles[self.current_triangle_idx]
+            desired_velocity = current_triangle.get_desired_velocity(self.current_position)
+
+            # Create a Twist message to control the robot
             twist_msg = Twist()
-            twist_msg.linear.x = desired_vel[0]
-            twist_msg.linear.y = desired_vel[1]
-            # For simplicity, we set angular velocity to zero.
-            twist_msg.angular.z = 0.0
-            
+            twist_msg.linear.x = desired_velocity[0]
+            twist_msg.linear.y = desired_velocity[1]
+            twist_msg.angular.z = 0.0  # No angular velocity for now
+
+            # Publish the velocity command
             self.cmd_pub.publish(twist_msg)
-            self.rate.sleep()
+
+    def control_loop_callback(self):
+        """ Callback for the control loop timer """
+        self.run()
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    # Example triangles with vertices
+    triangles = [
+        Triangle([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+        Triangle([[1.0, 0.0], [2.0, 0.0], [1.0, 1.0]]),
+        Triangle([[1.0, 1.0], [2.0, 1.0], [2.0, 0.0]])
+    ]
+
+    # Define the path (transitioning between triangles)
+    graph = TriangleGraph(triangles)
+    graph.set_path([1, 2])  # Transition from triangle 0 to triangle 1, and then from 1 to 2
+
+    # Calculate and set vector fields based on the path
+    graph.calculate_vector_fields()
+
+    # Create the controller and run the loop
+    controller = VectorFieldController(graph)
+    controller.run()
+
+    rclpy.spin(controller)
+
+    controller.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
-    try:
-        controller = VectorFieldController()
-        controller.run()
-    except rospy.ROSInterruptException:
-        pass
+    main()
