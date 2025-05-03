@@ -126,24 +126,45 @@ class TriangleGraph:
 
     def calculate_vector_fields(self):
         """
-        Given the current path, calculate and set the vector field for each triangle.
-        The vector field should guide the robot towards the next triangle.
+        Given the current path, calculate and set the vector field for each triangle in the path.
+        The vector field should guide the robot towards the specific edge separating the triangles.
         """
-        for i in range(len(self.triangles) - 1):
-            current_triangle = self.triangles[i]
-            next_triangle = self.triangles[i + 1]
+        # Iterate over each triangle in the path (except the last one)
+        for i in range(len(self.path) - 1):
+            current_triangle = self.triangles[self.path[i]]
+            next_triangle = self.triangles[self.path[i + 1]]
 
-            # Calculate a simple vector field that directs the robot towards the next triangle
-            # Example: average direction from the centroid of the current triangle to the centroid of the next triangle
-            centroid_current = np.mean(current_triangle.vertices, axis=0)
-            centroid_next = np.mean(next_triangle.vertices, axis=0)
+            # The transition edge is the one shared by the current triangle and the next triangle
+            # Let's assume the transition edge is the edge that has a vertex in common between the two triangles
+            transition_edge_idx = self.find_transition_edge(current_triangle, next_triangle)
 
-            # Calculate the direction vector (normalized)
-            direction = centroid_next - centroid_current
-            direction /= np.linalg.norm(direction)  # Normalize the vector
+            # Get the vertices of the transition edge
+            p1 = current_triangle.vertices[transition_edge_idx]
+            p2 = current_triangle.vertices[(transition_edge_idx + 1) % 3]  # The next vertex in the edge
 
-            # Set the transition direction for the current triangle
-            current_triangle.set_field_vectors([direction, direction, direction])
+            # Calculate the direction from p1 to p2 (transition edge)
+            transition_direction = p2 - p1
+            transition_direction /= np.linalg.norm(transition_direction)  # Normalize the direction
+
+            # Set the vector field for the current triangle (towards the transition edge)
+            current_triangle.set_field_vectors([transition_direction, transition_direction, transition_direction])
+
+    def find_transition_edge(self, current_triangle, next_triangle):
+        """
+        Find the edge shared between two triangles (the edge that transitions from current to next triangle).
+        :param current_triangle: The current triangle object.
+        :param next_triangle: The next triangle object.
+        :return: The index of the shared edge.
+        """
+        # Iterate through the edges of the current triangle and the next triangle
+        for i in range(3):
+            edge_current = set([tuple(current_triangle.vertices[i]), tuple(current_triangle.vertices[(i + 1) % 3])])
+            for j in range(3):
+                edge_next = set([tuple(next_triangle.vertices[j]), tuple(next_triangle.vertices[(j + 1) % 3])])
+                if edge_current == edge_next:
+                    return i  # Return the index of the edge from the current triangle
+        return None  # If no shared edge is found (should not happen if path is correct)
+
 
 class VectorFieldController(Node):
     def __init__(self, graph):
